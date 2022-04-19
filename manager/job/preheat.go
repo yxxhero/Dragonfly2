@@ -52,8 +52,18 @@ type PreheatType string
 const (
 	PreheatImageType PreheatType = "image"
 	PreheatFileType  PreheatType = "file"
-	timeout                      = 1 * time.Minute
 )
+
+const (
+	timeout = 1 * time.Minute
+)
+
+var defaultHTTPClient = &http.Client{
+	Timeout: timeout,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	},
+}
 
 var accessURLPattern, _ = regexp.Compile("^(.*)://(.*)/v2/(.*)/manifests/(.*)")
 
@@ -73,6 +83,10 @@ type preheatImage struct {
 	tag      string
 }
 
+func (pm *preheatImage) reference() string {
+	return fmt.Sprintf("%s/%s:%s", pm.domain, pm.name, pm.tag)
+}
+
 func newPreheat(job *internaljob.Job, bizTag string) (Preheat, error) {
 	return &preheat{
 		job:    job,
@@ -89,7 +103,7 @@ func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Schedule
 
 	url := json.URL
 	filter := json.Filter
-	rawheader := json.Headers
+	rawHeaders := json.Headers
 
 	// Initialize queues
 	queues := getSchedulerQueues(schedulers)
@@ -114,7 +128,7 @@ func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Schedule
 				URL:     url,
 				Tag:     p.bizTag,
 				Filter:  filter,
-				Headers: rawheader,
+				Headers: rawHeaders,
 			},
 		}
 	default:
@@ -129,11 +143,12 @@ func (p *preheat) CreatePreheat(ctx context.Context, schedulers []model.Schedule
 }
 
 func (p *preheat) createGroupJob(ctx context.Context, files []*internaljob.PreheatRequest, queues []internaljob.Queue) (*internaljob.GroupJobState, error) {
-	signatures := []*machineryv1tasks.Signature{}
 	var urls []string
 	for i := range files {
 		urls = append(urls, files[i].URL)
 	}
+
+	signatures := []*machineryv1tasks.Signature{}
 	for _, queue := range queues {
 		for _, file := range files {
 			args, err := internaljob.MarshalRequest(file)
@@ -149,8 +164,8 @@ func (p *preheat) createGroupJob(ctx context.Context, files []*internaljob.Prehe
 			})
 		}
 	}
-	group, err := machineryv1tasks.NewGroup(signatures...)
 
+	group, err := machineryv1tasks.NewGroup(signatures...)
 	if err != nil {
 		return nil, err
 	}
@@ -172,11 +187,12 @@ func (p *preheat) getLayers(ctx context.Context, image *preheatImage, preheatArg
 	ctx, span := tracer.Start(ctx, config.SpanGetLayers, trace.WithSpanKind(trace.SpanKindProducer))
 	defer span.End()
 
-	ocispecManifest, err := p.getManifests(ctx, image, preheatArgs.Username, preheatArgs.Password)
+	manifest, err := p.getManifest(ctx, image, preheatArgs.Username, preheatArgs.Password)
 	if err != nil {
 		return nil, err
 	}
-	layers, err := p.parseLayers(ocispecManifest, preheatArgs, image)
+
+	layers, err := p.parseLayers(manifest, preheatArgs, image)
 	if err != nil {
 		return nil, err
 	}
@@ -210,22 +226,16 @@ func (p *preheat) getResolver(ctx context.Context, username, password string) re
 	creds := func(string) (string, string, error) {
 		return username, password, nil
 	}
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+
 	options := docker.ResolverOptions{}
 	options.Hosts = docker.ConfigureDefaultRegistries(
-		docker.WithClient(client),
+		docker.WithClient(defaultHTTPClient),
 		docker.WithAuthorizer(docker.NewDockerAuthorizer(
-			docker.WithAuthClient(client),
+			docker.WithAuthClient(defaultHTTPClient),
 			docker.WithAuthCreds(creds),
 		)),
 	)
 	return docker.NewResolver(options)
-
 }
 
 func getAuthToken(ctx context.Context, header http.Header, preheatArgs types.PreheatArgs) (string, error) {
@@ -245,14 +255,7 @@ func getAuthToken(ctx context.Context, header http.Header, preheatArgs types.Pre
 		req.SetBasicAuth(preheatArgs.Username, preheatArgs.Password)
 	}
 
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := defaultHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -288,34 +291,31 @@ func authURL(wwwAuth []string) string {
 	return fmt.Sprintf("%s?%s", host, query)
 }
 
-func (p *preheat) getManifests(ctx context.Context, image *preheatImage, username, password string) (ocispec.Manifest, error) {
-
+func (p *preheat) getManifest(ctx context.Context, image *preheatImage, username, password string) (ocispec.Manifest, error) {
 	resolver := p.getResolver(ctx, username, password)
-
-	// combine image url and tag
-	i := fmt.Sprintf("%s/%s:%s", image.domain, image.name, image.tag)
-
-	_, imageDesc, err := resolver.Resolve(ctx, i)
+	name, desc, err := resolver.Resolve(ctx, image.reference())
 	if err != nil {
 		return ocispec.Manifest{}, err
 	}
-	f, err := resolver.Fetcher(ctx, i)
+
+	fetcher, err := resolver.Fetcher(ctx, name)
 	if err != nil {
 		return ocispec.Manifest{}, err
 	}
-	r, err := f.Fetch(ctx, imageDesc)
+
+	r, err := fetcher.Fetch(ctx, desc)
 	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("failed to fetch %s: %w", imageDesc.Digest, err)
+		return ocispec.Manifest{}, fmt.Errorf("failed to fetch %s: %w", desc.Digest, err)
 	}
 	defer r.Close()
 
 	descResponse, err := io.ReadAll(r)
 	if err != nil {
-		return ocispec.Manifest{}, fmt.Errorf("failed to read %s: %w", imageDesc.Digest, err)
+		return ocispec.Manifest{}, fmt.Errorf("failed to read %s: %w", desc.Digest, err)
 	}
 
 	platform := platforms.Only(platforms.DefaultSpec())
-	switch imageDesc.MediaType {
+	switch desc.MediaType {
 	case images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
 
 		var manifest ocispec.Manifest
@@ -323,7 +323,7 @@ func (p *preheat) getManifests(ctx context.Context, image *preheatImage, usernam
 			return ocispec.Manifest{}, err
 		}
 
-		if manifest.Config.Digest == imageDesc.Digest && (!platform.Match(*manifest.Config.Platform)) {
+		if manifest.Config.Digest == desc.Digest && (!platform.Match(*manifest.Config.Platform)) {
 			return ocispec.Manifest{}, fmt.Errorf("manifest: invalid platform %s: %w", manifest.Config.Platform, err)
 		}
 
@@ -340,7 +340,7 @@ func (p *preheat) getManifests(ctx context.Context, image *preheatImage, usernam
 			Annotations: idx.Annotations,
 		}, nil
 	default:
-		return ocispec.Manifest{}, fmt.Errorf("unsupported manifest type %s", imageDesc.MediaType)
+		return ocispec.Manifest{}, fmt.Errorf("unsupported manifest type %s", desc.MediaType)
 	}
 }
 
@@ -352,22 +352,13 @@ func references(om ocispec.Manifest) []ocispec.Descriptor {
 }
 
 func (p *preheat) parseLayers(om ocispec.Manifest, preheatArgs types.PreheatArgs, image *preheatImage) ([]*internaljob.PreheatRequest, error) {
-
 	var layers []*internaljob.PreheatRequest
-
 	req, err := http.NewRequestWithContext(context.Background(), "GET", preheatArgs.URL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := defaultHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

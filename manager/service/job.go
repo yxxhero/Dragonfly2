@@ -78,6 +78,10 @@ func (s *service) CreatePreheatJob(ctx context.Context, json types.CreatePreheat
 		return nil, err
 	}
 
+	// Delete user privacy
+	delete(args, "username")
+	delete(args, "password")
+
 	job := model.Job{
 		TaskID:            groupJobState.GroupUUID,
 		BIO:               json.BIO,
